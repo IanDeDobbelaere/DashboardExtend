@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Dashboard Extend",
+  "icons": {
+    "16": "DashboardExtend_Icon16.png",
+    "32": "DashboardExtend_Icon32.png",
+    "48": "DashboardExtend_Icon48.png",
+    "128": "DashboardExtend_Icon128.png"
+  },
+  "version": "0.1",
+  "description": "An extension for Smart Construction Dashboard, which introduces new features to the solution with a focus on session modification.",
+  "permissions": ["activeTab"],
+  "content_scripts": [
+    {
+      "matches": ["https://dashboard.smartconstruction.com/*"],
+      "js": ["contentScript.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "core.js", 
+        "ui.js", 
+        "feature_PCExport.js",
+        "feature_measurementsToolbar.js"
+      ],
+      "matches": ["https://dashboard.smartconstruction.com/*"]
+    }
+  ]
+}
