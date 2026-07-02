@@ -23,7 +23,8 @@
         "core.js", 
         "ui.js", 
         "feature_PCExport.js",
-        "feature_measurementsToolbar.js"
+        "feature_measurementsToolbar.js",
+        "proj4.js"
       ],
       "matches": ["https://dashboard.smartconstruction.com/*"]
     }
