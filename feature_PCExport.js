@@ -1,5 +1,5 @@
 (function() {
-    const utils = window.DashboardExtend.utils;
+    const hostDom = window.DashboardExtend.hostDom;
     const state = window.DashboardExtend.state;
     const extensionResourceBase = (() => {
         const scriptSrc = document.currentScript && document.currentScript.src;
@@ -25,10 +25,6 @@
 
     function cleanText(value) {
         return String(value || '').replace(/\s+/g, ' ').trim();
-    }
-
-    function getNodeText(node) {
-        return cleanText(node && (node.innerText || node.textContent));
     }
 
     function sanitizeFilenamePart(value, fallback) {
@@ -58,41 +54,15 @@
     }
 
     function getProjectName() {
-        const nav = utils.findDeepNode(n => n.tagName === 'SC-PROJECT-VIEWER-NAV');
-        if (nav) {
-            const h3 = utils.findDeepNode(n => n.tagName === 'H3', nav);
-            if (h3) {
-                const spans = utils.findAllDeepNodes(n => n.tagName === 'SPAN', h3);
-                if (spans[1] && getNodeText(spans[1])) return getNodeText(spans[1]);
-                if (getNodeText(h3)) return getNodeText(h3);
-            }
-        }
-
-        return document.title || 'Project';
+        return hostDom.getProjectName();
     }
 
     function getPolygonName() {
-        const detail = utils.findDeepNode(n => n.tagName === 'SC-ANNOTATION-DETAIL');
-        if (detail) {
-            const heading = utils.findDeepNode(n => n.tagName === 'H3', detail);
-            if (heading && getNodeText(heading)) return getNodeText(heading);
-        }
-
-        return 'Polygon';
+        return hostDom.getPolygonName();
     }
 
     function getTimelineDate() {
-        const timeline = utils.findDeepNode(n => n.tagName === 'CESIUM-TIMELINE') ||
-            utils.findDeepNode(n => n.tagName === 'SC-TIMELINE');
-        if (!timeline) return '';
-
-        const divs = utils.findAllDeepNodes(n => n.tagName === 'DIV', timeline);
-        for (let i = 0; i < divs.length; i++) {
-            const text = getNodeText(divs[i]);
-            if (text && /\d/.test(text) && text.length <= 120) return text;
-        }
-
-        return getNodeText(timeline);
+        return hostDom.getTimelineDate();
     }
 
     function formatTimelineDateForFilename(value) {
@@ -137,17 +107,10 @@
     }
 
     function extractPolygonData(calib) {
-        const litComponent = utils.findDeepNode(n => n.tagName === "SC-BASIC-ANNOTATION-EDITOR");
+        const litComponent = hostDom.getPolygonEditor();
         if (!litComponent || !litComponent._annotationState) throw new Error("Could not locate your polygon.");
 
-        let rawCoords = null;
-        const commonNames = ["coordinates", "positions", "polygonBoundary", "points", "vertices", "geometry"];
-        for (let i = 0; i < commonNames.length; i++) {
-            const value = litComponent._annotationState[commonNames[i]];
-            if (Array.isArray(value) && value.length > 2) {
-                rawCoords = value; break;
-            }
-        }
+        const rawCoords = hostDom.getPolygonCoordinates();
         if (!rawCoords) throw new Error("Could not extract coordinates from polygon.");
 
         const vertices = rawCoords.map(v => {
@@ -191,8 +154,8 @@
     }
 
    // --- 🚀 BACKGROUND WEB WORKER ENGINE ---
-    function runExportWorker(payload, callback, btnEl) {
-        const workerCode = `
+    function createExportWorkerCode() {
+        return `
             let proj4LoadAttempted = false;
             let proj4LoadSource = "none";
 
@@ -226,6 +189,75 @@
                 const rows = []; let clippedCount = 0; let droppedCount = 0;
 
                 if (exportFormat === 'dxf' || exportFormat === 'dxf-mesh') rows.push("0\\nSECTION\\n2\\nENTITIES");
+
+                function createPointWriter(format) {
+                    if (format === 'dxf') {
+                        return {
+                            writePoint(x, y, z) {
+                                rows.push(\`0\\nPOINT\\n8\\nAutoHarvestedPoints\\n10\\n\${x.toFixed(6)}\\n20\\n\${y.toFixed(6)}\\n30\\n\${z.toFixed(4)}\`);
+                            }
+                        };
+                    }
+
+                    return {
+                        writePoint(x, y, z) {
+                            rows.push(\`\${x.toFixed(6)},\${y.toFixed(6)},\${z.toFixed(4)}\`);
+                        }
+                    };
+                }
+
+                function createMeshWriter(rawGridSize) {
+                    const grid = new Map();
+                    const gs = rawGridSize || 1.0;
+
+                    function getKey(gx, gy) {
+                        return gx + "," + gy;
+                    }
+
+                    function getOrCreateCell(gx, gy) {
+                        const key = getKey(gx, gy);
+                        let cell = grid.get(key);
+                        if (!cell) {
+                            cell = { gx, gy, x: gx * gs + gs / 2, y: gy * gs + gs / 2, zSum: 0, count: 0 };
+                            grid.set(key, cell);
+                        }
+                        return cell;
+                    }
+
+                    return {
+                        writePoint(x, y, z) {
+                            const gx = Math.floor(x / gs);
+                            const gy = Math.floor(y / gs);
+                            const cell = getOrCreateCell(gx, gy);
+                            cell.zSum += z;
+                            cell.count++;
+                        },
+                        flush() {
+                            let faceCount = 0;
+
+                            grid.forEach(cell => {
+                                cell.z = cell.zSum / cell.count;
+                            });
+
+                            grid.forEach(cell => {
+                                const c1 = cell;
+                                const c2 = grid.get(getKey(cell.gx + 1, cell.gy));
+                                const c3 = grid.get(getKey(cell.gx + 1, cell.gy + 1));
+                                const c4 = grid.get(getKey(cell.gx, cell.gy + 1));
+
+                                if (c2 && c3 && c4) {
+                                    rows.push(\`0\\n3DFACE\\n8\\nAutoHarvestedMesh\\n10\\n\${c1.x.toFixed(4)}\\n20\\n\${c1.y.toFixed(4)}\\n30\\n\${c1.z.toFixed(4)}\\n11\\n\${c2.x.toFixed(4)}\\n21\\n\${c2.y.toFixed(4)}\\n31\\n\${c2.z.toFixed(4)}\\n12\\n\${c3.x.toFixed(4)}\\n22\\n\${c3.y.toFixed(4)}\\n32\\n\${c3.z.toFixed(4)}\\n13\\n\${c4.x.toFixed(4)}\\n23\\n\${c4.y.toFixed(4)}\\n33\\n\${c4.z.toFixed(4)}\`);
+                                    faceCount++;
+                                }
+                            });
+
+                            return { cellCount: grid.size, faceCount };
+                        }
+                    };
+                }
+
+                const meshWriter = exportFormat === 'dxf-mesh' ? createMeshWriter(gridSize) : null;
+                const pointWriter = meshWriter || createPointWriter(exportFormat);
 
                 function applyMatrix(rawX, rawY, rawZ, m) {
                     return {
@@ -269,51 +301,87 @@
                 // --- DYNAMIC PROJECTION ENGINE ---
                 let dynamicProjString = null;
                 let dynamicProjectionKind = null;
-                if (activeLocalGrid && activeLocalGrid.projType) {
-                    const pType = activeLocalGrid.projType.toLowerCase();
-                    if (pType.includes("sterea") || pType.includes("stereographic")) {
-                        dynamicProjectionKind = "sterea";
-                        dynamicProjString = \`+proj=sterea +lat_0=\${activeLocalGrid.originLat} +lon_0=\${activeLocalGrid.originLng} +k=\${activeLocalGrid.scaleFactor || 1} +x_0=\${activeLocalGrid.originEasting} +y_0=\${activeLocalGrid.originNorthing} +datum=WGS84 +units=m +no_defs\`;
-                    } else if (pType.includes("mercator")) {
-                        dynamicProjectionKind = "tmerc";
-                        dynamicProjString = \`+proj=tmerc +lat_0=\${activeLocalGrid.originLat} +lon_0=\${activeLocalGrid.originLng} +k=\${activeLocalGrid.scaleFactor || 1} +x_0=\${activeLocalGrid.originEasting} +y_0=\${activeLocalGrid.originNorthing} +datum=WGS84 +units=m +no_defs\`;
-                    }
+
+                function prepareRotation(rotation, sign) {
+                    const radRot = deg2rad(rotation * sign);
+                    return { sign, cos: Math.cos(radRot), sin: Math.sin(radRot) };
                 }
 
-                function projectToLocalSite(lng, lat, settings, rotSign = 1) {
+                function prepareLocalGridContext(settings) {
+                    if (!settings) return null;
+
+                    if (settings.projType) {
+                        const pType = settings.projType.toLowerCase();
+                        if (pType.includes("sterea") || pType.includes("stereographic")) {
+                            dynamicProjectionKind = "sterea";
+                            dynamicProjString = "+proj=sterea +lat_0=" + settings.originLat + " +lon_0=" + settings.originLng + " +k=" + (settings.scaleFactor || 1) + " +x_0=" + settings.originEasting + " +y_0=" + settings.originNorthing + " +datum=WGS84 +units=m +no_defs";
+                        } else if (pType.includes("mercator")) {
+                            dynamicProjectionKind = "tmerc";
+                            dynamicProjString = "+proj=tmerc +lat_0=" + settings.originLat + " +lon_0=" + settings.originLng + " +k=" + (settings.scaleFactor || 1) + " +x_0=" + settings.originEasting + " +y_0=" + settings.originNorthing + " +datum=WGS84 +units=m +no_defs";
+                        }
+                    }
+
+                    const radLat = deg2rad(settings.originLat);
+                    const radLng = deg2rad(settings.originLng);
+                    const rotation = settings.rotation || 0;
+                    const usesProj4Projection = typeof proj4 !== 'undefined' && !!dynamicProjString;
+
+                    return {
+                        originEasting: settings.originEasting || 0,
+                        originNorthing: settings.originNorthing || 0,
+                        originEcef: usesProj4Projection ? null : lngLatAltToEcef(settings.originLng, settings.originLat, 0),
+                        slong: Math.sin(radLng),
+                        clong: Math.cos(radLng),
+                        slat: Math.sin(radLat),
+                        clat: Math.cos(radLat),
+                        scaleFactor: settings.scaleFactor,
+                        applyFallbackScale: typeof proj4 === 'undefined' && settings.scaleFactor,
+                        hasRotation: !!settings.rotation,
+                        usesProj4Projection,
+                        rotationsBySign: {
+                            "1": prepareRotation(rotation, 1),
+                            "-1": prepareRotation(rotation, -1),
+                            "0": prepareRotation(rotation, 0)
+                        }
+                    };
+                }
+
+                const localGridContext = prepareLocalGridContext(activeLocalGrid);
+                const rotationCandidateConfigs = [
+                    { name: "positive", sign: 1 },
+                    { name: "negative", sign: -1 },
+                    { name: "none", sign: 0 }
+                ];
+
+                function projectToLocalSite(lng, lat, context, rotSign = 1) {
                     let east, north;
 
-                    if (typeof proj4 !== 'undefined' && dynamicProjString) {
+                    if (context.usesProj4Projection) {
                         const projected = proj4("EPSG:4326", dynamicProjString, [lng, lat]);
                         east = projected[0];
                         north = projected[1];
                     } else {
-                        const originEcef = lngLatAltToEcef(settings.originLng, settings.originLat, 0);
                         const wgsEcef = lngLatAltToEcef(lng, lat, 0); 
-                        const dx = wgsEcef.x - originEcef.x; const dy = wgsEcef.y - originEcef.y; const dz = wgsEcef.z - originEcef.z;
-                        const radLat = deg2rad(settings.originLat); const radLng = deg2rad(settings.originLng);
-                        const slong = Math.sin(radLng); const clong = Math.cos(radLng);
-                        const slat = Math.sin(radLat); const clat = Math.cos(radLat);
+                        const dx = wgsEcef.x - context.originEcef.x; const dy = wgsEcef.y - context.originEcef.y; const dz = wgsEcef.z - context.originEcef.z;
                         
-                        east = -slong * dx + clong * dy + (settings.originEasting || 0);
-                        north = -slat * clong * dx - slat * slong * dy + clat * dz + (settings.originNorthing || 0);
+                        east = -context.slong * dx + context.clong * dy + context.originEasting;
+                        north = -context.slat * context.clong * dx - context.slat * context.slong * dy + context.clat * dz + context.originNorthing;
                     }
 
-                    if (settings.rotation) {
-                        const dx = east - (settings.originEasting || 0);
-                        const dy = north - (settings.originNorthing || 0);
-                        const radRot = deg2rad(settings.rotation * rotSign);
-                        const cosRot = Math.cos(radRot); const sinRot = Math.sin(radRot);
+                    if (context.hasRotation) {
+                        const dx = east - context.originEasting;
+                        const dy = north - context.originNorthing;
+                        const rotation = context.rotationsBySign[String(rotSign)];
                         
-                        east = (settings.originEasting || 0) + ((dx * cosRot) - (dy * sinRot));
-                        north = (settings.originNorthing || 0) + ((dx * sinRot) + (dy * cosRot));
+                        east = context.originEasting + ((dx * rotation.cos) - (dy * rotation.sin));
+                        north = context.originNorthing + ((dx * rotation.sin) + (dy * rotation.cos));
                     }
 
-                    if (typeof proj4 === 'undefined' && settings.scaleFactor) {
-                        const dx = east - (settings.originEasting || 0);
-                        const dy = north - (settings.originNorthing || 0);
-                        east = (settings.originEasting || 0) + (dx * settings.scaleFactor);
-                        north = (settings.originNorthing || 0) + (dy * settings.scaleFactor);
+                    if (context.applyFallbackScale) {
+                        const dx = east - context.originEasting;
+                        const dy = north - context.originNorthing;
+                        east = context.originEasting + (dx * context.scaleFactor);
+                        north = context.originNorthing + (dy * context.scaleFactor);
                     }
 
                     return { easting: east, northing: north };
@@ -322,31 +390,54 @@
                 let selectedRotationSign = null;
                 const inputClipMode = clipMode;
 
-                if (clipMode === 'ecef' && activeLocalGrid) {
+                if (clipMode === 'ecef' && localGridContext) {
                     selectedRotationSign = -1;
                     polygonBoundary = polygonBoundary.map(pt => {
                         const wgs = ecefToLngLatAltPrecise(pt[0], pt[1], pt[2] || 0);
-                        const local = projectToLocalSite(wgs.lng, wgs.lat, activeLocalGrid, selectedRotationSign);
+                        const local = projectToLocalSite(wgs.lng, wgs.lat, localGridContext, selectedRotationSign);
                         return [local.easting, local.northing];
                     });
                     clipMode = 'projected';
                 }
 
-                function isPointInPolygon(point, polygon) {
-                    let x = point[0], y = point[1], inside = false;
+                function preparePolygon(polygon) {
+                    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+                    const edges = [];
+
                     for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-                        let xi = polygon[i][0], yi = polygon[i][1], xj = polygon[j][0], yj = polygon[j][1];
-                        let intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+                        const xi = polygon[i][0], yi = polygon[i][1], xj = polygon[j][0], yj = polygon[j][1];
+                        minX = Math.min(minX, xi);
+                        maxX = Math.max(maxX, xi);
+                        minY = Math.min(minY, yi);
+                        maxY = Math.max(maxY, yi);
+                        edges.push({ xi, yi, xj, yj, deltaX: xj - xi, deltaY: yj - yi });
+                    }
+
+                    return { minX, maxX, minY, maxY, edges };
+                }
+
+                function isWithinPreparedBounds(x, y, preparedPolygon) {
+                    return x >= preparedPolygon.minX && x <= preparedPolygon.maxX && y >= preparedPolygon.minY && y <= preparedPolygon.maxY;
+                }
+
+                function isPointInPreparedPolygon(x, y, preparedPolygon) {
+                    let inside = false;
+                    const edges = preparedPolygon.edges;
+                    for (let i = 0; i < edges.length; i++) {
+                        const edge = edges[i];
+                        const intersect = ((edge.yi > y) !== (edge.yj > y)) && (x < edge.deltaX * (y - edge.yi) / edge.deltaY + edge.xi);
                         if (intersect) inside = !inside;
                     }
                     return inside;
                 }
 
-                let finalPoints = [];
-                let minX = Math.min(...polygonBoundary.map(p => p[0])); let maxX = Math.max(...polygonBoundary.map(p => p[0]));
-                let minY = Math.min(...polygonBoundary.map(p => p[1])); let maxY = Math.max(...polygonBoundary.map(p => p[1]));
+                const preparedPolygon = preparePolygon(polygonBoundary);
+
+                let minX = preparedPolygon.minX; let maxX = preparedPolygon.maxX;
+                let minY = preparedPolygon.minY; let maxY = preparedPolygon.maxY;
                 let processedCount = 0;
                 let bboxCandidateCount = 0;
+                let meshStats = null;
                 let projectedRange = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
                 let wgsRange = { minLng: Infinity, maxLng: -Infinity, minLat: Infinity, maxLat: -Infinity };
                 let transformSourceCounts = {};
@@ -374,17 +465,21 @@
 
                 function updateRotationCandidate(name, easting, northing) {
                     const stats = rotationCandidateStats[name];
-                    if (!stats || !Number.isFinite(easting) || !Number.isFinite(northing)) return;
+                    if (!stats || !Number.isFinite(easting) || !Number.isFinite(northing)) return false;
 
                     stats.range.minX = Math.min(stats.range.minX, easting);
                     stats.range.maxX = Math.max(stats.range.maxX, easting);
                     stats.range.minY = Math.min(stats.range.minY, northing);
                     stats.range.maxY = Math.max(stats.range.maxY, northing);
 
-                    if (easting >= minX && easting <= maxX && northing >= minY && northing <= maxY) {
+                    if (isWithinPreparedBounds(easting, northing, preparedPolygon)) {
                         stats.bboxCandidateCount++;
-                        if (isPointInPolygon([easting, northing], polygonBoundary)) stats.insideCount++;
+                        const inside = isPointInPreparedPolygon(easting, northing, preparedPolygon);
+                        if (inside) stats.insideCount++;
+                        return inside;
                     }
+
+                    return false;
                 }
 
                 for (const tile of cachedTiles) {
@@ -408,29 +503,25 @@
 
                         if (clipMode === 'wgs84') {
                             testX = wgs.lng; testY = wgs.lat;
-                        } else if (clipMode === 'projected' && activeLocalGrid) {
+                        } else if (clipMode === 'projected' && localGridContext) {
                             if (selectedRotationSign === null) {
-                                const candidates = [
-                                    { name: "positive", sign: 1, point: projectToLocalSite(wgs.lng, wgs.lat, activeLocalGrid, 1) },
-                                    { name: "negative", sign: -1, point: projectToLocalSite(wgs.lng, wgs.lat, activeLocalGrid, -1) },
-                                    { name: "none", sign: 0, point: projectToLocalSite(wgs.lng, wgs.lat, activeLocalGrid, 0) }
-                                ];
+                                let chosenPoint = null;
+                                for (let c = 0; c < rotationCandidateConfigs.length; c++) {
+                                    const candidate = rotationCandidateConfigs[c];
+                                    const candidatePoint = projectToLocalSite(wgs.lng, wgs.lat, localGridContext, candidate.sign);
+                                    if (c === 0) chosenPoint = candidatePoint;
 
-                                let chosen = candidates[0];
-                                for (let c = 0; c < candidates.length; c++) {
-                                    const candidate = candidates[c];
-                                    updateRotationCandidate(candidate.name, candidate.point.easting, candidate.point.northing);
-
-                                    if (selectedRotationSign === null && isPointInPolygon([candidate.point.easting, candidate.point.northing], polygonBoundary)) {
+                                    const inside = updateRotationCandidate(candidate.name, candidatePoint.easting, candidatePoint.northing);
+                                    if (selectedRotationSign === null && inside) {
                                         selectedRotationSign = candidate.sign;
-                                        chosen = candidate;
+                                        chosenPoint = candidatePoint;
                                     }
                                 }
 
-                                testX = chosen.point.easting;
-                                testY = chosen.point.northing;
+                                testX = chosenPoint.easting;
+                                testY = chosenPoint.northing;
                             } else {
-                                localPt = projectToLocalSite(wgs.lng, wgs.lat, activeLocalGrid, selectedRotationSign);
+                                localPt = projectToLocalSite(wgs.lng, wgs.lat, localGridContext, selectedRotationSign);
                                 testX = localPt.easting; testY = localPt.northing;
                             }
                         } else {
@@ -438,53 +529,24 @@
                         }
 
                         expandProjectedRange(testX, testY);
-                        if (testX < minX || testX > maxX || testY < minY || testY > maxY) continue;
+                        if (!isWithinPreparedBounds(testX, testY, preparedPolygon)) continue;
                         bboxCandidateCount++;
 
-                        if (isPointInPolygon([testX, testY], polygonBoundary)) {
+                        if (isPointInPreparedPolygon(testX, testY, preparedPolygon)) {
                             // 🔥 THE FIX: We are now pushing LOCAL Easting, Northing, and Z (Vertical Shift Applied) instead of ECEF!
                             let finalZ = wgs.alt + (activeLocalGrid && activeLocalGrid.verticalShift ? activeLocalGrid.verticalShift : 0);
                             let finalX = clipMode === 'projected' ? testX : wgs.lng;
                             let finalY = clipMode === 'projected' ? testY : wgs.lat;
                             
-                            finalPoints.push({ x: finalX, y: finalY, z: finalZ });
+                            pointWriter.writePoint(finalX, finalY, finalZ);
                             clippedCount++;
                         }
                     }
                 }
 
-                if (exportFormat === 'dxf-mesh') {
+                if (meshWriter) {
                     self.postMessage({ status: "⚙️ Generating Grid Mesh..." });
-                    const grid = new Map();
-                    const gs = gridSize || 1.0;
-
-                    for(let pt of finalPoints) {
-                        let gx = Math.floor(pt.x / gs), gy = Math.floor(pt.y / gs);
-                        let key = gx + "," + gy;
-                        if(!grid.has(key)) grid.set(key, { x: gx*gs + gs/2, y: gy*gs + gs/2, zSum: 0, count: 0 });
-                        let cell = grid.get(key);
-                        cell.zSum += pt.z; cell.count++;
-                    }
-
-                    grid.forEach(cell => cell.z = cell.zSum / cell.count);
-
-                    grid.forEach((cell, key) => {
-                        let coords = key.split(",");
-                        let gx = parseInt(coords[0]), gy = parseInt(coords[1]);
-                        let c1 = cell, c2 = grid.get((gx+1) + "," + gy), c3 = grid.get((gx+1) + "," + (gy+1)), c4 = grid.get(gx + "," + (gy+1));
-
-                        if(c2 && c3 && c4) {
-                            rows.push(\`0\\n3DFACE\\n8\\nAutoHarvestedMesh\\n10\\n\${c1.x.toFixed(4)}\\n20\\n\${c1.y.toFixed(4)}\\n30\\n\${c1.z.toFixed(4)}\\n11\\n\${c2.x.toFixed(4)}\\n21\\n\${c2.y.toFixed(4)}\\n31\\n\${c2.z.toFixed(4)}\\n12\\n\${c3.x.toFixed(4)}\\n22\\n\${c3.y.toFixed(4)}\\n32\\n\${c3.z.toFixed(4)}\\n13\\n\${c4.x.toFixed(4)}\\n23\\n\${c4.y.toFixed(4)}\\n33\\n\${c4.z.toFixed(4)}\`);
-                        }
-                    });
-                } else {
-                    for (let pt of finalPoints) {
-                        if (exportFormat === 'dxf') {
-                            rows.push(\`0\\nPOINT\\n8\\nAutoHarvestedPoints\\n10\\n\${pt.x.toFixed(6)}\\n20\\n\${pt.y.toFixed(6)}\\n30\\n\${pt.z.toFixed(4)}\`);
-                        } else {
-                            rows.push(\`\${pt.x.toFixed(6)},\${pt.y.toFixed(6)},\${pt.z.toFixed(4)}\`);
-                        }
-                    }
+                    meshStats = meshWriter.flush();
                 }
 
                 if (exportFormat === 'dxf' || exportFormat === 'dxf-mesh') rows.push("0\\nENDSEC\\n0\\nEOF");
@@ -501,6 +563,8 @@
                         dynamicProjString,
                         inputClipMode,
                         effectiveClipMode: clipMode,
+                        clippedCount,
+                        droppedCount,
                         rotationApplied: !!(activeLocalGrid && activeLocalGrid.rotation),
                         lockedRotationSign: selectedRotationSign,
                         polygonRange: { minX, maxX, minY, maxY },
@@ -509,11 +573,16 @@
                         processedCount,
                         bboxCandidateCount,
                         transformSourceCounts,
-                        rotationCandidateStats
+                        rotationCandidateStats,
+                        meshStats
                     }
                 });
             };
         `;
+    }
+
+    function runExportWorker(payload, callback, btnEl) {
+        const workerCode = createExportWorkerCode();
 
         const blob = new Blob([workerCode], { type: 'application/javascript' });
         const worker = new Worker(URL.createObjectURL(blob));
@@ -525,8 +594,279 @@
         worker.postMessage(payload);
     }
 
+    function createPointDecodeStats() {
+        return {
+            decodedTiles: 0,
+            decodedPoints: 0,
+            floatTiles: 0,
+            floatPoints: 0,
+            quantizedTiles: 0,
+            quantizedPoints: 0,
+            skippedTiles: 0,
+            skippedPoints: 0,
+            duplicateTiles: 0,
+            duplicatePoints: 0,
+            duplicateSamples: [],
+            skippedSamples: []
+        };
+    }
+
+    function resetPointCaptureDiagnostics() {
+        state.transformLookupHitSamples = [];
+        state.transformLookupMissSamples = [];
+        state.pointDecodeStats = createPointDecodeStats();
+    }
+
+    function countMapEntries(map) {
+        return map ? Object.keys(map).length : 0;
+    }
+
+    function getTileCaptureProgress(captureState) {
+        const sourceState = captureState || state;
+        const decodeStats = sourceState.pointDecodeStats || {};
+        const cachedTiles = sourceState.cachedTiles || [];
+        const pointCount = Number.isFinite(sourceState.totalPointsHarvested)
+            ? sourceState.totalPointsHarvested
+            : cachedTiles.reduce((sum, tile) => sum + (tile.length || 0), 0);
+        const tilesetHistory = sourceState.tilesetStatsHistory || [];
+        const latestTilesetStats = sourceState.lastTilesetStats || {};
+        const progressParts = [
+            pointCount,
+            cachedTiles.length,
+            decodeStats.decodedTiles || 0,
+            decodeStats.decodedPoints || 0,
+            decodeStats.duplicateTiles || 0,
+            decodeStats.duplicatePoints || 0,
+            decodeStats.skippedTiles || 0,
+            decodeStats.skippedPoints || 0,
+            decodeStats.floatTiles || 0,
+            decodeStats.quantizedTiles || 0,
+            countMapEntries(sourceState.contentTransformByUrl),
+            countMapEntries(sourceState.externalTilesetTransformByUrl),
+            tilesetHistory.length,
+            latestTilesetStats.pntsTransforms || 0,
+            latestTilesetStats.externalTilesets || 0
+        ];
+
+        return {
+            pointCount,
+            tileCount: cachedTiles.length,
+            decodedTiles: decodeStats.decodedTiles || 0,
+            decodedPoints: decodeStats.decodedPoints || 0,
+            duplicateTiles: decodeStats.duplicateTiles || 0,
+            duplicatePoints: decodeStats.duplicatePoints || 0,
+            skippedTiles: decodeStats.skippedTiles || 0,
+            skippedPoints: decodeStats.skippedPoints || 0,
+            tilesetCount: tilesetHistory.length,
+            signature: progressParts.join('|'),
+            hasPoints: pointCount > 0
+        };
+    }
+
+    function cloneCaptureTiming(captureTiming) {
+        return {
+            pollIntervalMs: captureTiming.pollIntervalMs,
+            minListenSeconds: captureTiming.minListenSeconds,
+            stableSecondsRequired: captureTiming.stableSecondsRequired,
+            stableThresholdSeconds: captureTiming.stableThresholdSeconds,
+            maxListenSeconds: captureTiming.maxListenSeconds,
+            elapsedListenSeconds: captureTiming.elapsedListenSeconds,
+            stableSeconds: captureTiming.stableSeconds,
+            finishReason: captureTiming.finishReason,
+            timedOut: captureTiming.timedOut,
+            latestProgress: captureTiming.latestProgress ? { ...captureTiming.latestProgress } : null
+        };
+    }
+
+    function createCaptureSession(options) {
+        const sessionHostDom = options.hostDom || hostDom;
+        const sessionState = options.state || state;
+        const btnEl = options.btnEl || null;
+        const originalText = options.originalText || (btnEl ? btnEl.innerText : '');
+        const setTimeoutFn = options.setTimeoutFn || setTimeout;
+        const clearTimeoutFn = options.clearTimeoutFn || clearTimeout;
+        const setIntervalFn = options.setIntervalFn || setInterval;
+        const clearIntervalFn = options.clearIntervalFn || clearInterval;
+        const pollIntervalMs = options.pollIntervalMs === undefined ? 500 : options.pollIntervalMs;
+        const minListenMs = options.minListenMs === undefined ? 12000 : options.minListenMs;
+        const stableThresholdMs = options.stableThresholdMs === undefined ? 8000 : options.stableThresholdMs;
+        const maxListenMs = options.maxListenMs === undefined ? 90000 : options.maxListenMs;
+        const minListenTicks = Math.ceil(minListenMs / pollIntervalMs);
+        const stableTicksRequired = Math.ceil(stableThresholdMs / pollIntervalMs);
+        const maxListenTicks = Math.ceil(maxListenMs / pollIntervalMs);
+        const layerDiscoveryDelayMs = options.layerDiscoveryDelayMs === undefined ? 500 : options.layerDiscoveryDelayMs;
+        const layerRefreshDelayMs = options.layerRefreshDelayMs === undefined ? 500 : options.layerRefreshDelayMs;
+        const alertFn = options.alertFn || alert;
+        const onCaptureReady = options.onCaptureReady || function() {};
+        const onTimeout = options.onTimeout || function() {};
+        const onNoLayerToggles = options.onNoLayerToggles || function() {};
+        const getProgress = options.getProgress || (() => getTileCaptureProgress(sessionState));
+
+        let layerDiscoveryTimer = null;
+        let layerRestoreTimer = null;
+        let progressPoller = null;
+        let elapsedTicks = 0;
+        let stableTicks = 0;
+        let lastProgressSignature = null;
+        let started = false;
+        let stopped = false;
+        const captureTiming = {
+            pollIntervalMs,
+            minListenSeconds: (minListenTicks * pollIntervalMs) / 1000,
+            stableSecondsRequired: (stableTicksRequired * pollIntervalMs) / 1000,
+            stableThresholdSeconds: (stableTicksRequired * pollIntervalMs) / 1000,
+            maxListenSeconds: (maxListenTicks * pollIntervalMs) / 1000,
+            elapsedListenSeconds: 0,
+            stableSeconds: 0,
+            finishReason: null,
+            timedOut: false,
+            latestProgress: null
+        };
+
+        function setStatus(text) {
+            if (btnEl) btnEl.innerText = text;
+            if (typeof options.onStatus === 'function') options.onStatus(text);
+        }
+
+        function resetButton() {
+            if (!btnEl) return;
+            btnEl.innerText = originalText;
+            btnEl.disabled = false;
+        }
+
+        function safeClick(element) {
+            try {
+                if (element && typeof element.click === 'function') element.click();
+            } catch (e) {}
+        }
+
+        function clearTimers() {
+            if (layerDiscoveryTimer !== null) {
+                clearTimeoutFn(layerDiscoveryTimer);
+                layerDiscoveryTimer = null;
+            }
+            if (layerRestoreTimer !== null) {
+                clearTimeoutFn(layerRestoreTimer);
+                layerRestoreTimer = null;
+            }
+            if (progressPoller !== null) {
+                clearIntervalFn(progressPoller);
+                progressPoller = null;
+            }
+        }
+
+        function stop() {
+            stopped = true;
+            clearTimers();
+        }
+
+        function finishCapture(reason) {
+            if (stopped) return;
+            captureTiming.finishReason = reason;
+            stop();
+            setStatus("⚙️ Crunching Math (Background)...");
+            onCaptureReady(cloneCaptureTiming(captureTiming));
+        }
+
+        function timeoutCapture() {
+            if (stopped) return;
+            captureTiming.timedOut = true;
+            captureTiming.finishReason = "no-data-timeout";
+            stop();
+            resetButton();
+            onTimeout(cloneCaptureTiming(captureTiming));
+            alertFn("Timeout: No data intercepted!");
+        }
+
+        function abortNoLayerToggles() {
+            if (stopped) return;
+            captureTiming.finishReason = "no-layer-toggles";
+            stop();
+            resetButton();
+            onNoLayerToggles(cloneCaptureTiming(captureTiming));
+        }
+
+        function pollProgress() {
+            if (stopped) return;
+
+            elapsedTicks++;
+            captureTiming.elapsedListenSeconds = (elapsedTicks * pollIntervalMs) / 1000;
+
+            const progress = getProgress();
+            captureTiming.latestProgress = {
+                pointCount: progress.pointCount,
+                tileCount: progress.tileCount,
+                decodedTiles: progress.decodedTiles,
+                decodedPoints: progress.decodedPoints,
+                duplicateTiles: progress.duplicateTiles,
+                duplicatePoints: progress.duplicatePoints,
+                skippedTiles: progress.skippedTiles,
+                skippedPoints: progress.skippedPoints,
+                tilesetCount: progress.tilesetCount
+            };
+
+            if (progress.hasPoints && progress.signature === lastProgressSignature) {
+                stableTicks++;
+                captureTiming.stableSeconds = (stableTicks * pollIntervalMs) / 1000;
+            } else {
+                lastProgressSignature = progress.signature;
+                stableTicks = 0;
+                captureTiming.stableSeconds = 0;
+            }
+
+            const quietEnough = elapsedTicks >= minListenTicks && stableTicks >= stableTicksRequired;
+            const reachedMaxWait = elapsedTicks >= maxListenTicks;
+
+            if (progress.hasPoints && quietEnough) {
+                finishCapture("quiet-period");
+            } else if (progress.hasPoints && reachedMaxWait) {
+                finishCapture("max-wait-with-data");
+            } else if (!progress.hasPoints && reachedMaxWait) {
+                timeoutCapture();
+            }
+        }
+
+        function startListening() {
+            if (stopped) return;
+            setStatus("⏳ Listening for Data...");
+            progressPoller = setIntervalFn(pollProgress, pollIntervalMs);
+        }
+
+        function refreshLayerToggles() {
+            if (stopped) return;
+            const togglesToClick = sessionHostDom.getPointCloudLayerToggles ? sessionHostDom.getPointCloudLayerToggles() : [];
+
+            if (!togglesToClick || togglesToClick.length === 0) {
+                abortNoLayerToggles();
+                return;
+            }
+
+            togglesToClick.forEach(safeClick);
+            layerRestoreTimer = setTimeoutFn(() => {
+                togglesToClick.forEach(safeClick);
+                startListening();
+            }, layerRefreshDelayMs);
+        }
+
+        function start() {
+            if (started) return;
+            started = true;
+            setStatus("⏳ Auto-Reloading Data Layers...");
+
+            const tabBtn = sessionHostDom.getDataLayersTab ? sessionHostDom.getDataLayersTab() : null;
+            safeClick(tabBtn);
+            layerDiscoveryTimer = setTimeoutFn(refreshLayerToggles, layerDiscoveryDelayMs);
+        }
+
+        return {
+            start,
+            stop,
+            getTiming: () => cloneCaptureTiming(captureTiming)
+        };
+    }
+
     async function executeDownload(btnEl, exportFormat, gridSize = 1.0) {
-        const calib = utils.getCalibrationData();
+        const calib = hostDom.getCalibrationData();
         if (!state.globalTransformMatrix) return alert("Missing Global Matrix! Pan or zoom map slightly to capture the tileset.");
         
         let polygonData;
@@ -563,143 +903,69 @@
         const preloadedTileCount = state.cachedTiles.length;
         const preloadedPointCount = state.cachedTiles.reduce((sum, tile) => sum + (tile.length || 0), 0);
         state.totalPointsHarvested = preloadedPointCount;
-        state.transformLookupHitSamples = [];
-        state.transformLookupMissSamples = [];
-        state.pointDecodeStats = {
-            decodedTiles: 0,
-            decodedPoints: 0,
-            floatTiles: 0,
-            floatPoints: 0,
-            quantizedTiles: 0,
-            quantizedPoints: 0,
-            skippedTiles: 0,
-            skippedPoints: 0,
-            duplicateTiles: 0,
-            duplicatePoints: 0,
-            duplicateSamples: [],
-            skippedSamples: []
+        resetPointCaptureDiagnostics();
+
+        const launchExport = (captureTiming) => {
+            runExportWorker({
+                cachedTiles: state.cachedTiles, polygonBoundary, clipMode,
+                globalTransformMatrix: state.globalTransformMatrix, activeLocalGrid: calib.activeLocalGrid,
+                exportFormat, gridSize, extensionResourceBase
+            }, (result) => {
+                if (result.diagnostics) {
+                    const diagnosticReport = {
+                        calibration: calib,
+                        polygonMode: polygonData.mode,
+                        clipMode,
+                        preloadedTileCount,
+                        preloadedPointCount,
+                        totalPointsHarvested: state.totalPointsHarvested,
+                        captureTiming,
+                        pointDecodeStats: state.pointDecodeStats,
+                        tilesetStats: state.lastTilesetStats,
+                        tilesetStatsHistory: state.tilesetStatsHistory,
+                        transformLookupHitSamples: state.transformLookupHitSamples,
+                        transformLookupMissSamples: state.transformLookupMissSamples,
+                        contentTransformMapSize: Object.keys(state.contentTransformByUrl || {}).length,
+                        externalTilesetTransformMapSize: Object.keys(state.externalTilesetTransformByUrl || {}).length,
+                        worker: result.diagnostics
+                    };
+                    console.log("Dashboard Extend PC export diagnostics:", diagnosticReport);
+                    console.log("Dashboard Extend PC export diagnostics JSON:\\n" + JSON.stringify(diagnosticReport, null, 2));
+                }
+
+                if (result.clippedCount === 0) {
+                    alert("0 points found inside your polygon. If the polygon is tight, try drawing a slightly larger one.");
+                } else {
+                    const extension = result.exportFormat === 'csv' ? 'csv' : 'dxf';
+                    const mimeType = result.exportFormat === 'csv' ? 'text/csv;charset=utf-8;' : 'application/dxf';
+                    const blob = new Blob([result.rows], { type: mimeType });
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement("a"); link.href = url; link.download = buildExportFilename(extension); link.click(); URL.revokeObjectURL(url);
+
+                    console.log(`✅ Kept Local Coordinate Points: ${result.clippedCount} | 🗑️ Dropped: ${result.droppedCount}`);
+                }
+
+                state.totalPointsHarvested = state.cachedTiles.reduce((sum, tile) => sum + (tile.length || 0), 0);
+                btnEl.innerText = originalText; btnEl.disabled = false;
+            }, btnEl);
         };
-        btnEl.innerText = "⏳ Auto-Reloading Data Layers...";
-        
-        setTimeout(() => {
-            const svgPath = utils.findDeepNode(n => n.tagName === 'PATH' && n.getAttribute('d') && n.getAttribute('d').startsWith('M264.5'));
-            let tabBtn = svgPath;
-            while (tabBtn && tabBtn.tagName !== 'SC-TAB') { tabBtn = tabBtn.parentNode || (tabBtn.getRootNode && tabBtn.getRootNode().host); }
-            if (tabBtn) tabBtn.click();
 
-            setTimeout(() => {
-                const asBuiltLayer = utils.findDeepNode(n => n.tagName === 'SC-AS-BUILT-LAYER');
-                const surveyLayer = utils.findDeepNode(n => n.tagName === 'SC-SURVEY-LAYER');
-                let togglesToClick = [];
-                
-                if (asBuiltLayer) {
-                    const btn = utils.findDeepNode(n => n.tagName === 'BUTTON', utils.findDeepNode(n => n.tagName === 'SC-SHOW-TOGGLE', asBuiltLayer));
-                    if (btn) togglesToClick.push(btn);
-                }
-                if (surveyLayer) {
-                    const btn = utils.findDeepNode(n => n.tagName === 'BUTTON', utils.findDeepNode(n => n.tagName === 'SC-SHOW-TOGGLE', surveyLayer));
-                    if (btn) togglesToClick.push(btn);
-                }
-                
-                if (togglesToClick.length > 0) {
-                    togglesToClick.forEach(btn => btn.click());
-                    
-                    setTimeout(() => {
-                        togglesToClick.forEach(btn => btn.click());
-                        btnEl.innerText = "⏳ Listening for Data...";
-                        const pollIntervalMs = 500;
-                        const minListenTicks = 24; // 12s minimum capture time for progressive LOD tiles.
-                        const stableTicksRequired = 16; // 8s quiet period before export.
-                        const maxListenTicks = 180; // 90s cap.
-                        let lastCount = -1, silenceTicks = 0, elapsedTicks = 0;
-                        let captureTiming = {
-                            pollIntervalMs,
-                            minListenSeconds: (minListenTicks * pollIntervalMs) / 1000,
-                            stableSecondsRequired: (stableTicksRequired * pollIntervalMs) / 1000,
-                            maxListenSeconds: (maxListenTicks * pollIntervalMs) / 1000,
-                            elapsedListenSeconds: 0,
-                            stableSeconds: 0
-                        };
-                        
-                        const finishCapture = () => {
-                            clearInterval(silencePoller);
-                            btnEl.innerText = "⚙️ Crunching Math (Background)...";
-
-                            runExportWorker({
-                                cachedTiles: state.cachedTiles, polygonBoundary, clipMode,
-                                globalTransformMatrix: state.globalTransformMatrix, activeLocalGrid: calib.activeLocalGrid,
-                                exportFormat, gridSize, extensionResourceBase
-                            }, (result) => {
-                                if (result.diagnostics) {
-                                    const diagnosticReport = {
-                                        calibration: calib,
-                                        polygonMode: polygonData.mode,
-                                        clipMode,
-                                        preloadedTileCount,
-                                        preloadedPointCount,
-                                        totalPointsHarvested: state.totalPointsHarvested,
-                                        captureTiming,
-                                        pointDecodeStats: state.pointDecodeStats,
-                                        tilesetStats: state.lastTilesetStats,
-                                        tilesetStatsHistory: state.tilesetStatsHistory,
-                                        transformLookupHitSamples: state.transformLookupHitSamples,
-                                        transformLookupMissSamples: state.transformLookupMissSamples,
-                                        contentTransformMapSize: Object.keys(state.contentTransformByUrl || {}).length,
-                                        externalTilesetTransformMapSize: Object.keys(state.externalTilesetTransformByUrl || {}).length,
-                                        worker: result.diagnostics
-                                    };
-                                    console.log("Dashboard Extend PC export diagnostics:", diagnosticReport);
-                                    console.log("Dashboard Extend PC export diagnostics JSON:\\n" + JSON.stringify(diagnosticReport, null, 2));
-                                }
-
-                                if (result.clippedCount === 0) {
-                                    alert("0 points found inside your polygon. If the polygon is tight, try drawing a slightly larger one.");
-                                } else {
-                                    const extension = result.exportFormat === 'csv' ? 'csv' : 'dxf';
-                                    const mimeType = result.exportFormat === 'csv' ? 'text/csv;charset=utf-8;' : 'application/dxf';
-                                    const blob = new Blob([result.rows], { type: mimeType });
-                                    const url = URL.createObjectURL(blob);
-                                    const link = document.createElement("a"); link.href = url; link.download = buildExportFilename(extension); link.click(); URL.revokeObjectURL(url);
-
-                                    console.log(`✅ Kept Local Coordinate Points: ${result.clippedCount} | 🗑️ Dropped: ${result.droppedCount}`);
-                                }
-
-                                state.totalPointsHarvested = state.cachedTiles.reduce((sum, tile) => sum + (tile.length || 0), 0);
-                                btnEl.innerText = originalText; btnEl.disabled = false;
-                            }, btnEl);
-                        };
-
-                        const silencePoller = setInterval(() => {
-                            elapsedTicks++;
-                            captureTiming.elapsedListenSeconds = (elapsedTicks * pollIntervalMs) / 1000;
-
-                            if (state.totalPointsHarvested > 0 && state.totalPointsHarvested === lastCount) {
-                                silenceTicks++;
-                                captureTiming.stableSeconds = (silenceTicks * pollIntervalMs) / 1000;
-                            } else {
-                                lastCount = state.totalPointsHarvested; silenceTicks = 0; captureTiming.stableSeconds = 0;
-                            }
-
-                            const hasPoints = state.totalPointsHarvested > 0;
-                            const quietEnough = elapsedTicks >= minListenTicks && silenceTicks >= stableTicksRequired;
-                            const reachedMaxWait = elapsedTicks >= maxListenTicks;
-
-                            if (hasPoints && (quietEnough || reachedMaxWait)) {
-                                finishCapture();
-                            } else if (!hasPoints && reachedMaxWait) {
-                                clearInterval(silencePoller); btnEl.innerText = originalText; btnEl.disabled = false;
-                                alert("Timeout: No data intercepted!");
-                            }
-                        }, pollIntervalMs);
-
-                    }, 500);
-                } else { btnEl.innerText = originalText; btnEl.disabled = false; }
-            }, 1000); 
-        }, 500);
+        createCaptureSession({
+            btnEl,
+            originalText,
+            onCaptureReady: launchExport
+        }).start();
     }
 
-    window.DashboardExtend.UI.registerButton('sc-dashboardextend-csv-btn', 'Export Localized Selected Pointcloud (.csv)', (btnEl) => executeDownload(btnEl, 'csv'));
-    window.DashboardExtend.UI.registerButton('sc-dashboardextend-dxf-btn', 'Export Localized Selected Pointcloud (.dxf)', (btnEl) => {
+    window.DashboardExtend.testHooks = window.DashboardExtend.testHooks || {};
+    window.DashboardExtend.testHooks.pcExport = {
+        createExportWorkerCode,
+        createCaptureSession,
+        getTileCaptureProgress
+    };
+
+    window.DashboardExtend.UI.registerButton('sc-dashboardextend-csv-btn', 'Export Selected Pointcloud (.csv)', (btnEl) => executeDownload(btnEl, 'csv'));
+    window.DashboardExtend.UI.registerButton('sc-dashboardextend-dxf-btn', 'Export Selected Pointcloud (.dxf)', (btnEl) => {
         let size = prompt("Enter grid size for mesh decimation (e.g., 1.0 for 1m/1ft cells):", "1.0");
         if (!size || isNaN(parseFloat(size))) return;
         executeDownload(btnEl, 'dxf-mesh', parseFloat(size));

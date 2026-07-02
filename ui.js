@@ -1,4 +1,6 @@
 (function() {
+    const hostDom = window.DashboardExtend.hostDom;
+
     window.DashboardExtend.UI = {
         buttons: [],
         
@@ -8,16 +10,16 @@
 
         initObserver: function() {
             setInterval(() => {
-                const targetContainer = window.DashboardExtend.utils.findDeepNode(n => n.tagName === 'SC-ANNOTATION-DETAIL');
+                const targetContainer = hostDom.getAnnotationDetail();
                 if (!targetContainer) return; 
-                if (window.DashboardExtend.utils.findDeepNode(n => n.id === 'sc-harvester-inline-panel', targetContainer)) return;
+                if (hostDom.findDeepNode(n => n.id === 'sc-harvester-inline-panel', targetContainer)) return;
 
                 this.injectPanel(targetContainer);
             }, 1000);
         },
 
         injectPanel: function(targetContainer) {
-            const measurementsPanel = window.DashboardExtend.utils.findDeepNode(n => n.tagName === 'SC-MEASUREMENTS-PANEL');
+            const measurementsPanel = hostDom.getMeasurementsPanel();
             if (measurementsPanel) {
                 measurementsPanel.style.height = '100%';
                 measurementsPanel.style.marginBottom = '0px';
