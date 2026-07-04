@@ -417,6 +417,11 @@
             return isNaN(parsed) ? 0 : parsed;
         }
 
+        function extractEpsgCode(str) {
+            const match = String(str || '').match(/EPSG[:\s-]*(\d+)/i);
+            return match ? `EPSG:${match[1]}` : null;
+        }
+
         function getCalibrationData() {
             const spans = getCalibrationSpans();
             if (spans.length === 0) return { activeLocalGrid: null, activeEpsg: null };
@@ -433,8 +438,8 @@
                 if (label === 'Coordinate system') {
                     const textStr = text.trim();
                     tempCoordinateSystem = textStr;
-                    const match = textStr.match(/(EPSG:\d+)/i);
-                    if (match) tempEpsgCode = match[1].toUpperCase();
+                    const epsgCode = extractEpsgCode(textStr);
+                    if (epsgCode) tempEpsgCode = epsgCode;
                 }
                 else if (label === 'Projection type') { tempGrid.projType = text.trim(); }
                 else if (label === 'Rotation') { tempGrid.rotation = cleanNum(text); foundLocal = true; }

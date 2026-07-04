@@ -239,7 +239,7 @@ function workerReadyTile(tile) {
     };
 }
 
-async function runExportWorker(dashboard, payload) {
+async function runExportWorker(dashboard, payload, options = {}) {
     const messages = [];
     const workerSandbox = {
         self: {
@@ -248,7 +248,9 @@ async function runExportWorker(dashboard, payload) {
             }
         },
         console,
-        importScripts() {}
+        importScripts() {},
+        fetch: options.fetch,
+        proj4: options.proj4
     };
     workerSandbox.globalThis = workerSandbox;
 
@@ -520,6 +522,127 @@ test('host DOM adapter exposes export metadata, polygon coordinates, layer toggl
     assert.equal(calibration.activeLocalGrid.originLng, 4.1);
     assert.equal(calibration.activeLocalGrid.scaleFactor, 1.0002);
     assert.equal(calibration.activeLocalGrid.verticalShift, 3.5);
+});
+
+test('host DOM adapter recognizes EPSG projection labels without a colon', () => {
+    const { sandbox, dashboard } = loadExtension();
+    const body = resetFakeBody(sandbox.document);
+    const shell = appendFakeChild(body, createFakeNode('SC-SHELL'));
+    const shellShadow = attachFakeShadow(shell);
+
+    appendFakeChild(shellShadow, createFakeNode('SPAN', {
+        text: 'Belgian Lambert 72 EPSG 31370',
+        attributes: { 'data-label': 'Coordinate system' }
+    }));
+
+    const calibration = dashboard.hostDom.getCalibrationData();
+    assert.equal(calibration.activeEpsg, 'EPSG:31370');
+    assert.equal(calibration.activeLocalGrid, null);
+    assert.equal(calibration.coordinateSystemLabel, 'Belgian Lambert 72 EPSG 31370');
+});
+
+test('point cloud export treats planar active EPSG cartesian polygon as projected', () => {
+    const { sandbox, dashboard } = loadExtension({ withPcExport: true });
+    const body = resetFakeBody(sandbox.document);
+    const shell = appendFakeChild(body, createFakeNode('SC-SHELL'));
+    const shellShadow = attachFakeShadow(shell);
+
+    const vertices = [
+        { x: 2603158.2459154516, y: 5691667.454321914, z: 0 },
+        { x: 2603166.705254413, y: 5691667.454321914, z: 0 },
+        { x: 2603166.705254413, y: 5691684.853699058, z: 0 },
+        { x: 2603158.2459154516, y: 5691684.853699058, z: 0 }
+    ];
+    const editor = appendFakeChild(shellShadow, createFakeNode('SC-BASIC-ANNOTATION-EDITOR'));
+    editor._annotationState = { vertices };
+
+    const polygonData = dashboard.testHooks.pcExport.extractPolygonData({
+        activeEpsg: 'EPSG:31466',
+        coordinateSystemLabel: 'EPSG:31466 / DHDN / 3-degree Gauss-Kruger zone 2'
+    });
+
+    assert.equal(polygonData.mode, 'projected');
+    assert.equal(JSON.stringify(polygonData.boundary), JSON.stringify(vertices.map(vertex => [vertex.x, vertex.y])));
+});
+
+test('DXF export settings validate Fast Mesh grid size and reserve TIN mode', () => {
+    const { dashboard } = loadExtension({ withPcExport: true });
+    const validate = dashboard.testHooks.pcExport.validateDxfExportSettings;
+    const fastMesh = validate({ exportType: 'fast-mesh', gridSize: '2.5' });
+    const invalidGrid = validate({ exportType: 'fast-mesh', gridSize: '0' });
+    const partialGrid = validate({ exportType: 'fast-mesh', gridSize: '1abc' });
+    const tinSurface = validate({ exportType: 'tin-surface', gridSize: '1' });
+
+    assert.equal(fastMesh.ok, true);
+    assert.equal(fastMesh.exportFormat, 'dxf-mesh');
+    assert.equal(fastMesh.exportType, 'fast-mesh');
+    assert.equal(fastMesh.gridSize, 2.5);
+
+    assert.equal(invalidGrid.ok, false);
+    assert.equal(invalidGrid.error, 'Grid size must be a number greater than 0.');
+    assert.equal(partialGrid.ok, false);
+    assert.equal(partialGrid.error, 'Grid size must be a number greater than 0.');
+
+    assert.equal(tinSurface.ok, false);
+    assert.equal(tinSurface.error, 'TIN Surface is not available yet. Use Fast Mesh for this export.');
+});
+
+test('DXF button opens modal, validates inline, and reports setup errors without prompt', async () => {
+    const { sandbox, dashboard } = loadExtension({ withPcExport: true });
+    sandbox.document.createElement = tagName => createFakeNode(String(tagName).toUpperCase());
+    const body = resetFakeBody(sandbox.document);
+
+    appendFakeChild(body, createFakeNode('SPAN', {
+        text: 'Belgian Lambert 72 EPSG 31370',
+        attributes: { 'data-label': 'Coordinate system' }
+    }));
+
+    dashboard.state.cachedTiles = [{ length: 12 }, { length: 8 }];
+    dashboard.state.totalPointsHarvested = 20;
+
+    let promptCalled = false;
+    sandbox.prompt = () => {
+        promptCalled = true;
+        return '5';
+    };
+
+    const dxfButtonConfig = sandbox.window.DashboardExtend.UI.buttons.find(button => button.id === 'sc-dashboardextend-dxf-btn');
+    assert.ok(dxfButtonConfig, 'DXF button is registered');
+
+    const btn = createFakeNode('BUTTON', { text: 'Export Selected Pointcloud (.dxf)' });
+    dxfButtonConfig.onClickCallback(btn);
+
+    assert.equal(promptCalled, false);
+
+    const modal = dashboard.hostDom.findDeepNode(node => node.id === 'sc-dashboardextend-dxf-modal', body);
+    assert.ok(modal, 'DXF modal is appended to the document');
+
+    const exportType = dashboard.hostDom.findDeepNode(node => node.id === 'sc-dashboardextend-dxf-export-type', modal);
+    const gridInput = dashboard.hostDom.findDeepNode(node => node.id === 'sc-dashboardextend-dxf-grid-size', modal);
+    const projection = dashboard.hostDom.findDeepNode(node => node.id === 'sc-dashboardextend-dxf-projection', modal);
+    const pointCount = dashboard.hostDom.findDeepNode(node => node.id === 'sc-dashboardextend-dxf-point-count', modal);
+    const submit = dashboard.hostDom.findDeepNode(node => node.id === 'sc-dashboardextend-dxf-submit', modal);
+    const error = dashboard.hostDom.findDeepNode(node => node.id === 'sc-dashboardextend-dxf-error', modal);
+
+    assert.equal(exportType.children[0].textContent, 'Fast Mesh - averaged grid cells');
+    assert.equal(exportType.children[1].textContent, 'TIN Surface - coming later');
+    assert.equal(exportType.children[1].disabled, true);
+    assert.equal(gridInput.value, '1.0');
+    assert.equal(projection.value, 'EPSG:31370 - Belgian Lambert 72 EPSG 31370');
+    assert.equal(pointCount.value, '20 captured points');
+
+    gridInput.value = '0';
+    assert.equal(submit.onclick(), false);
+    assert.equal(error.textContent, 'Grid size must be a number greater than 0.');
+    assert.equal(error.style.display, 'block');
+
+    gridInput.value = '2.5';
+    await submit.onclick();
+
+    assert.equal(promptCalled, false);
+    assert.match(error.textContent, /Missing Global Matrix/);
+    assert.equal(error.style.display, 'block');
+    assert.equal(submit.disabled, false);
 });
 
 test('measurements toolbar injects once beside drawing guides and mirrors visibility through hostDom', () => {
@@ -943,6 +1066,263 @@ test('export worker clips WGS84 points and formats CSV output', async () => {
     assert.equal(result.diagnostics.transformSourceCounts['tileset-content'], 1);
 });
 
+test('export worker converts accepted points to active EPSG projection before CSV output', async () => {
+    const { dashboard } = loadExtension({ withPcExport: true });
+    const ecef = lngLatAltToEcefArray(4, 50);
+    const tile = decodeTinyTile(dashboard, {
+        transform: translationMatrix(ecef[0], ecef[1], ecef[2]),
+        positions: [[0, 0, 0]]
+    });
+    const projectionCalls = [];
+
+    const result = await runExportWorker(dashboard, baseExportPayload(tile, {
+        polygonBoundary: [
+            [3.9999, 49.9999],
+            [4.0001, 49.9999],
+            [4.0001, 50.0001],
+            [3.9999, 50.0001]
+        ],
+        outputProjectionEpsg: 'EPSG:25832',
+        coordinateConversionApiUrl: 'https://dashboard.smartconstruction.com/api/v1/convertCoordinates',
+        coordinateConversionAuthToken: 'Bearer projection-token',
+        projectionBatchSize: 1
+    }), {
+        fetch: async (url, request) => {
+            const body = JSON.parse(request.body);
+            projectionCalls.push({ url, request, body });
+
+            return {
+                ok: true,
+                status: 200,
+                async json() {
+                    return {
+                        coordinates: body.coordinates.map(() => [123456.789, 987654.321, 0])
+                    };
+                }
+            };
+        }
+    });
+
+    assert.equal(projectionCalls.length, 1);
+    assert.equal(projectionCalls[0].url, 'https://dashboard.smartconstruction.com/api/v1/convertCoordinates');
+    assert.equal(projectionCalls[0].body.from, 'EPSG:4326');
+    assert.equal(projectionCalls[0].body.to, 'EPSG:25832');
+    assert.equal(projectionCalls[0].body.coordinates.length, 1);
+    assert.ok(Math.abs(projectionCalls[0].body.coordinates[0][0] - 4) < 1e-8);
+    assert.ok(Math.abs(projectionCalls[0].body.coordinates[0][1] - 50) < 1e-8);
+    assert.equal(projectionCalls[0].body.coordinates[0][2], 0);
+    assert.equal(result.clippedCount, 1);
+    assert.match(result.rows, /^123456\.789000,987654\.321000,-?0\.0000$/);
+    assert.equal(result.diagnostics.outputProjectionEpsg, 'EPSG:25832');
+    assert.equal(result.diagnostics.outputProjectionConvertedCount, 1);
+    assert.equal(result.diagnostics.outputProjectionApiCallCount, 1);
+});
+
+test('export worker uses local proj4 fast path for EPSG UTM projection output', async () => {
+    const { dashboard } = loadExtension({ withPcExport: true });
+    const ecef = lngLatAltToEcefArray(4, 50);
+    const tile = decodeTinyTile(dashboard, {
+        transform: translationMatrix(ecef[0], ecef[1], ecef[2]),
+        positions: [[0, 0, 0]]
+    });
+    const defs = {};
+    const projectionCalls = [];
+    const fakeProj4 = function(from, to, point) {
+        projectionCalls.push({ from, to, point });
+        if (to === 'EPSG:4326') return [4, 50, 0];
+        return [point[0] * 1000, point[1] * 1000, point[2] || 0];
+    };
+    fakeProj4.defs = function(code, definition) {
+        if (arguments.length === 1) return defs[code];
+        defs[code] = definition;
+        return definition;
+    };
+
+    const result = await runExportWorker(dashboard, baseExportPayload(tile, {
+        polygonBoundary: [
+            [3.9999, 49.9999],
+            [4.0001, 49.9999],
+            [4.0001, 50.0001],
+            [3.9999, 50.0001]
+        ],
+        outputProjectionEpsg: 'EPSG:25832',
+        outputProjectionLabel: 'EPSG:25832 / ETRS89 / UTM zone 32N',
+        coordinateConversionApiUrl: 'https://dashboard.smartconstruction.com/api/v1/convertCoordinates',
+        coordinateConversionAuthToken: 'Bearer projection-token'
+    }), {
+        proj4: fakeProj4,
+        fetch: async () => {
+            throw new Error('projection API should not be called for local UTM projection');
+        }
+    });
+
+    assert.equal(defs['EPSG:25832'], '+proj=utm +zone=32 +ellps=GRS80 +units=m +no_defs');
+    const outputProjectionCall = projectionCalls.find(call => call.to === 'EPSG:25832');
+    assert.ok(outputProjectionCall);
+    assert.equal(outputProjectionCall.from, 'EPSG:4326');
+    assert.ok(Math.abs(outputProjectionCall.point[0] - 4) < 1e-8);
+    assert.ok(Math.abs(outputProjectionCall.point[1] - 50) < 1e-8);
+    assert.match(result.rows, /^4000\.000000,50000\.000000,-?0\.0000$/);
+    assert.equal(result.diagnostics.outputProjectionMethod, 'proj4-local');
+    assert.equal(result.diagnostics.outputProjectionConvertedCount, 1);
+    assert.equal(result.diagnostics.outputProjectionApiCallCount, 0);
+    assert.equal(result.diagnostics.outputProjectionLocalDef.kind, 'etrs89-utm');
+});
+
+test('export worker uses local proj4 fast path for EPSG DHDN Gauss-Kruger output', async () => {
+    const { dashboard } = loadExtension({ withPcExport: true });
+    const ecef = lngLatAltToEcefArray(7.46, 51.35);
+    const tile = decodeTinyTile(dashboard, {
+        transform: translationMatrix(ecef[0], ecef[1], ecef[2]),
+        positions: [[0, 0, 0]]
+    });
+    const defs = {};
+    const projectionCalls = [];
+    const fakeProj4 = function(from, to, point) {
+        projectionCalls.push({ from, to, point });
+        if (to === 'EPSG:4326') return [7.46, 51.35, 0];
+        return [2601754.9218626632, 5691597.591214224, point[2] || 0];
+    };
+    fakeProj4.defs = function(code, definition) {
+        if (arguments.length === 1) return defs[code];
+        defs[code] = definition;
+        return definition;
+    };
+
+    const result = await runExportWorker(dashboard, baseExportPayload(tile, {
+        polygonBoundary: [
+            [7.4599, 51.3499],
+            [7.4601, 51.3499],
+            [7.4601, 51.3501],
+            [7.4599, 51.3501]
+        ],
+        outputProjectionEpsg: 'EPSG:31466',
+        outputProjectionLabel: 'EPSG:31466 / DHDN / 3-degree Gauss-Kruger zone 2',
+        coordinateConversionApiUrl: 'https://dashboard.smartconstruction.com/api/v1/convertCoordinates',
+        coordinateConversionAuthToken: 'Bearer projection-token'
+    }), {
+        proj4: fakeProj4,
+        fetch: async () => {
+            throw new Error('projection API should not be called for local Gauss-Kruger projection');
+        }
+    });
+
+    assert.equal(defs['EPSG:31466'], '+proj=tmerc +lat_0=0 +lon_0=6 +k=1 +x_0=2500000 +y_0=0 +ellps=bessel +datum=potsdam +units=m +no_defs');
+    const outputProjectionCall = projectionCalls.find(call => call.to === 'EPSG:31466');
+    assert.ok(outputProjectionCall);
+    assert.equal(outputProjectionCall.from, 'EPSG:4326');
+    assert.ok(Math.abs(outputProjectionCall.point[0] - 7.46) < 1e-8);
+    assert.ok(Math.abs(outputProjectionCall.point[1] - 51.35) < 1e-8);
+    assert.match(result.rows, /^2601754\.921863,5691597\.591214,-?0\.0000$/);
+    assert.equal(result.diagnostics.outputProjectionMethod, 'proj4-local');
+    assert.equal(result.diagnostics.outputProjectionConvertedCount, 1);
+    assert.equal(result.diagnostics.outputProjectionApiCallCount, 0);
+    assert.equal(result.diagnostics.outputProjectionLocalDef.kind, 'dhdn-gauss-kruger');
+});
+
+test('export worker clips projected EPSG polygon using local DHDN Gauss-Kruger projection', async () => {
+    const { dashboard } = loadExtension({ withPcExport: true });
+    const ecef = lngLatAltToEcefArray(7.46, 51.35);
+    const tile = decodeTinyTile(dashboard, {
+        transform: translationMatrix(ecef[0], ecef[1], ecef[2]),
+        positions: [[0, 0, 0]]
+    });
+    const defs = {};
+    const projectionCalls = [];
+    const fakeProj4 = function(from, to, point) {
+        projectionCalls.push({ from, to, point });
+        if (to === 'EPSG:4326') return [7.46, 51.35, 0];
+        return [2601754.9218626632, 5691597.591214224, point[2] || 0];
+    };
+    fakeProj4.defs = function(code, definition) {
+        if (arguments.length === 1) return defs[code];
+        defs[code] = definition;
+        return definition;
+    };
+
+    const result = await runExportWorker(dashboard, baseExportPayload(tile, {
+        polygonBoundary: [
+            [2601750, 5691590],
+            [2601760, 5691590],
+            [2601760, 5691605],
+            [2601750, 5691605]
+        ],
+        clipMode: 'projected',
+        outputProjectionEpsg: 'EPSG:31466',
+        outputProjectionLabel: 'EPSG:31466 / DHDN / 3-degree Gauss-Kruger zone 2',
+        coordinateConversionApiUrl: 'https://dashboard.smartconstruction.com/api/v1/convertCoordinates',
+        coordinateConversionAuthToken: 'Bearer projection-token'
+    }), {
+        proj4: fakeProj4,
+        fetch: async () => {
+            throw new Error('projection API should not be called for local projected clipping');
+        }
+    });
+
+    assert.equal(defs['EPSG:31466'], '+proj=tmerc +lat_0=0 +lon_0=6 +k=1 +x_0=2500000 +y_0=0 +ellps=bessel +datum=potsdam +units=m +no_defs');
+    assert.equal(result.clippedCount, 1);
+    assert.equal(result.diagnostics.effectiveClipMode, 'projected');
+    assert.equal(result.diagnostics.bboxCandidateCount, 1);
+    assert.match(result.rows, /^2601754\.921863,5691597\.591214,-?0\.0000$/);
+    assert.equal(result.diagnostics.outputProjectionMethod, 'proj4-local');
+    assert.equal(result.diagnostics.outputProjectionConvertedCount, 1);
+    assert.equal(result.diagnostics.outputProjectionApiCallCount, 0);
+    assert.ok(projectionCalls.some(call => call.to === 'EPSG:31466'));
+});
+
+test('export worker splits active EPSG projection batches after API 500 responses', async () => {
+    const { dashboard } = loadExtension({ withPcExport: true });
+    const tile = decodeTinyTile(dashboard, {
+        positions: [
+            [0, 0, 0],
+            [0, 0, 1]
+        ]
+    });
+    const projectionCalls = [];
+
+    const result = await runExportWorker(dashboard, baseExportPayload(tile, {
+        outputProjectionEpsg: 'EPSG:31370',
+        coordinateConversionApiUrl: 'https://dashboard.smartconstruction.com/api/v1/convertCoordinates',
+        coordinateConversionAuthToken: 'Bearer projection-token',
+        projectionBatchSize: 2
+    }), {
+        fetch: async (url, request) => {
+            const body = JSON.parse(request.body);
+            projectionCalls.push({ url, request, body });
+
+            if (body.coordinates.length > 1) {
+                return {
+                    ok: false,
+                    status: 500,
+                    async text() {
+                        return 'batch too large';
+                    }
+                };
+            }
+
+            return {
+                ok: true,
+                status: 200,
+                async json() {
+                    return {
+                        coordinates: body.coordinates.map(() => [123456.789, 987654.321, 0])
+                    };
+                }
+            };
+        }
+    });
+
+    assert.equal(projectionCalls.length, 3);
+    assert.equal(projectionCalls[0].body.coordinates.length, 2);
+    assert.equal(projectionCalls[1].body.coordinates.length, 1);
+    assert.equal(projectionCalls[2].body.coordinates.length, 1);
+    assert.equal(result.clippedCount, 2);
+    assert.equal(result.diagnostics.outputProjectionConvertedCount, 2);
+    assert.equal(result.diagnostics.outputProjectionApiCallCount, 3);
+    assert.equal(result.diagnostics.outputProjectionRetryCount, 1);
+    assert.equal(result.diagnostics.outputProjectionMaxBatchSize, 2);
+});
+
 test('export worker streams CSV output while preserving dropped point diagnostics', async () => {
     const { dashboard } = loadExtension({ withPcExport: true });
     const tile = decodeTinyTile(dashboard);
@@ -1135,6 +1515,172 @@ test('export worker converts ECEF polygon boundaries through the local grid once
     assert.equal(result.diagnostics.lockedRotationSign, -1);
     assert.equal(result.diagnostics.processedCount, 2);
     assert.equal(result.diagnostics.bboxCandidateCount, 1);
+});
+
+test('main thread supportsLocalProjectionEpsg recognizes EPSG:27700 and normalized EPSG:7953', () => {
+    const { dashboard } = loadExtension({ withPcExport: true });
+    const supports = dashboard.testHooks.pcExport.supportsLocalProjectionEpsg;
+
+    assert.equal(supports('EPSG:27700', ''), true);
+    assert.equal(supports('EPSG:7953', ''), true);
+    assert.equal(supports('EPSG:25832', ''), true);
+    assert.equal(supports('EPSG:31466', ''), true);
+    assert.equal(supports('EPSG:4326', ''), false);
+    assert.equal(supports('EPSG:99999', ''), false);
+    assert.equal(supports(null, ''), false);
+});
+
+test('export worker uses local proj4 fast path for EPSG:27700 British National Grid output', async () => {
+    const { dashboard } = loadExtension({ withPcExport: true });
+    const ecef = lngLatAltToEcefArray(-0.1, 51.5);
+    const tile = decodeTinyTile(dashboard, {
+        transform: translationMatrix(ecef[0], ecef[1], ecef[2]),
+        positions: [[0, 0, 0]]
+    });
+    const defs = {};
+    const projectionCalls = [];
+    const fakeProj4 = function(from, to, point) {
+        projectionCalls.push({ from, to, point });
+        if (to === 'EPSG:4326') return [-0.1, 51.5, 0];
+        return [530039.562, 180380.605, point[2] || 0];
+    };
+    fakeProj4.defs = function(code, definition) {
+        if (arguments.length === 1) return defs[code];
+        defs[code] = definition;
+        return definition;
+    };
+
+    const result = await runExportWorker(dashboard, baseExportPayload(tile, {
+        polygonBoundary: [
+            [-0.1001, 51.4999],
+            [-0.0999, 51.4999],
+            [-0.0999, 51.5001],
+            [-0.1001, 51.5001]
+        ],
+        outputProjectionEpsg: 'EPSG:27700',
+        outputProjectionLabel: 'EPSG:27700 / OSGB36 / British National Grid',
+        coordinateConversionApiUrl: 'https://dashboard.smartconstruction.com/api/v1/convertCoordinates',
+        coordinateConversionAuthToken: 'Bearer projection-token'
+    }), {
+        proj4: fakeProj4,
+        fetch: async () => {
+            throw new Error('projection API should not be called for local British National Grid projection');
+        }
+    });
+
+    assert.ok(defs['EPSG:27700']);
+    assert.ok(defs['EPSG:27700'].includes('+proj=tmerc'));
+    assert.ok(defs['EPSG:27700'].includes('+ellps=airy'));
+    const outputCall = projectionCalls.find(call => call.to === 'EPSG:27700');
+    assert.ok(outputCall);
+    assert.equal(outputCall.from, 'EPSG:4326');
+    assert.match(result.rows, /^530039\.562000,180380\.605000,-?0\.0000$/);
+    assert.equal(result.diagnostics.outputProjectionMethod, 'proj4-local');
+    assert.equal(result.diagnostics.outputProjectionConvertedCount, 1);
+    assert.equal(result.diagnostics.outputProjectionApiCallCount, 0);
+    assert.equal(result.diagnostics.outputProjectionLocalDef.kind, 'osgb36-british-national-grid');
+    assert.equal(result.diagnostics.crsWasNormalized, false);
+});
+
+test('export worker normalizes EPSG:7953 to EPSG:27700 and uses local proj4 path', async () => {
+    const { dashboard } = loadExtension({ withPcExport: true });
+    const ecef = lngLatAltToEcefArray(-0.1, 51.5);
+    const tile = decodeTinyTile(dashboard, {
+        transform: translationMatrix(ecef[0], ecef[1], ecef[2]),
+        positions: [[0, 0, 0]]
+    });
+    const defs = {};
+    const projectionCalls = [];
+    const fakeProj4 = function(from, to, point) {
+        projectionCalls.push({ from, to, point });
+        if (to === 'EPSG:4326') return [-0.1, 51.5, 0];
+        return [530039.562, 180380.605, point[2] || 0];
+    };
+    fakeProj4.defs = function(code, definition) {
+        if (arguments.length === 1) return defs[code];
+        defs[code] = definition;
+        return definition;
+    };
+
+    const result = await runExportWorker(dashboard, baseExportPayload(tile, {
+        polygonBoundary: [
+            [-0.1001, 51.4999],
+            [-0.0999, 51.4999],
+            [-0.0999, 51.5001],
+            [-0.1001, 51.5001]
+        ],
+        outputProjectionEpsg: 'EPSG:7953',
+        outputProjectionLabel: 'EPSG:7953 / ETRS89 to OSGB36',
+        coordinateConversionApiUrl: 'https://dashboard.smartconstruction.com/api/v1/convertCoordinates',
+        coordinateConversionAuthToken: 'Bearer projection-token'
+    }), {
+        proj4: fakeProj4,
+        fetch: async () => {
+            throw new Error('projection API should not be called for normalized British National Grid projection');
+        }
+    });
+
+    assert.ok(defs['EPSG:27700'], 'EPSG:27700 definition should be registered after normalization from 7953');
+    assert.ok(!defs['EPSG:7953'], 'EPSG:7953 should not be registered directly');
+    const outputCall = projectionCalls.find(call => call.to === 'EPSG:27700');
+    assert.ok(outputCall);
+    assert.equal(outputCall.from, 'EPSG:4326');
+    assert.match(result.rows, /^530039\.562000,180380\.605000,-?0\.0000$/);
+    assert.equal(result.diagnostics.outputProjectionEpsg, 'EPSG:27700');
+    assert.equal(result.diagnostics.outputProjectionEpsgRaw, 'EPSG:7953');
+    assert.equal(result.diagnostics.crsWasNormalized, true);
+    assert.equal(result.diagnostics.outputProjectionMethod, 'proj4-local');
+    assert.equal(result.diagnostics.outputProjectionConvertedCount, 1);
+    assert.equal(result.diagnostics.outputProjectionApiCallCount, 0);
+    assert.equal(result.diagnostics.outputProjectionLocalDef.kind, 'osgb36-british-national-grid');
+});
+
+test('export worker clips projected polygon using normalized EPSG:7953 as EPSG:27700', async () => {
+    const { dashboard } = loadExtension({ withPcExport: true });
+    const ecef = lngLatAltToEcefArray(-0.1, 51.5);
+    const tile = decodeTinyTile(dashboard, {
+        transform: translationMatrix(ecef[0], ecef[1], ecef[2]),
+        positions: [[0, 0, 0]]
+    });
+    const defs = {};
+    const projectionCalls = [];
+    const fakeProj4 = function(from, to, point) {
+        projectionCalls.push({ from, to, point });
+        if (to === 'EPSG:4326') return [-0.1, 51.5, 0];
+        return [530039.562, 180380.605, point[2] || 0];
+    };
+    fakeProj4.defs = function(code, definition) {
+        if (arguments.length === 1) return defs[code];
+        defs[code] = definition;
+        return definition;
+    };
+
+    const result = await runExportWorker(dashboard, baseExportPayload(tile, {
+        polygonBoundary: [
+            [530030, 180370],
+            [530050, 180370],
+            [530050, 180390],
+            [530030, 180390]
+        ],
+        clipMode: 'projected',
+        outputProjectionEpsg: 'EPSG:7953',
+        outputProjectionLabel: 'EPSG:7953 / ETRS89 to OSGB36',
+        coordinateConversionApiUrl: 'https://dashboard.smartconstruction.com/api/v1/convertCoordinates',
+        coordinateConversionAuthToken: 'Bearer projection-token'
+    }), {
+        proj4: fakeProj4,
+        fetch: async () => {
+            throw new Error('projection API should not be called for local projected clipping');
+        }
+    });
+
+    assert.equal(result.clippedCount, 1);
+    assert.equal(result.diagnostics.effectiveClipMode, 'projected');
+    assert.match(result.rows, /^530039\.562000,180380\.605000,-?0\.0000$/);
+    assert.equal(result.diagnostics.crsWasNormalized, true);
+    assert.equal(result.diagnostics.outputProjectionEpsg, 'EPSG:27700');
+    assert.equal(result.diagnostics.outputProjectionMethod, 'proj4-local');
+    assert.equal(result.diagnostics.outputProjectionApiCallCount, 0);
 });
 
 async function main() {
